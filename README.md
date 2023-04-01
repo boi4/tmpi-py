@@ -25,6 +25,7 @@ Run multiple MPI processes as a grid in a new tmux window and multiplex keyboard
 
 ## Installation
 Just copy the `tmpi.py` script somewhere in your `PATH`.
+If you run MPI on multiple hosts, the `tmpi.py` script must be available at the same location on each host.
 
 ## Example usage
 
