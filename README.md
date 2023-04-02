@@ -10,7 +10,6 @@ It has the following disadvantages:
 
 * you can run only one instance of `tmpi.py` on a single host
 * if you have mpi processes on other hosts, you need to be able to ssh into them
-* the tmux panes are not created in the order of the mpi ranks
 * `tmpi.py` opens a port for remote mpi processes to register themselves. This can be a security issue.
 
 Run multiple MPI processes as a grid in a new tmux window and multiplex keyboard input to all of them.

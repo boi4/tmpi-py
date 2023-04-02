@@ -62,112 +62,193 @@ async def run_cmd(cli, capture_stdout=False, exec=False, ignore_ret=False, backg
 
 
 
-async def handle_request(reader, writer, tmux_window, kill_dummy_event, tmux_lock):
+class Server:
     """
-    Controller side, async, handling of a mpi process registration
+    a tcp server that listens to requests by mpi processes
+    and manages the tmux panes + terminal connections
     """
-    # receive information about the mpi process
-    data = await reader.read(255)
 
-    message = data.decode()
-    client_info = json.loads(message)
+    def __init__(self, tmpi, nprocs, tmux_window, dummy_pane, mpirun_proc, tmux_lock, window):
+        self.tmpi = tmpi
+        self.nprocs = nprocs
+        self.tmux_window = tmux_window
+        self.dummy_pane = dummy_pane
+        self.mpirun_proc = mpirun_proc
+        self.tmux_lock = tmux_lock
+        self.window = window
 
-    #addr = writer.get_extra_info('peername')
-    #print(f"Received {message!r} from {addr!r}")
+        self.hostname = socket.gethostname()
 
-    controller_hostname = socket.gethostname()
-    mpi_host = client_info["client_hostname"]
-    mpi_pid = client_info["client_tmpi_pid"]
-    tmpfile = client_info["tmpfile"]
-    mpi_rank = client_info["mpi_rank"]
-    mpi_node_rank = client_info["mpi_node_rank"]
+        # ranks -> dict
+        self.client_infos = {}
+        # triggered when all initial mpi processes have sent registration request
+        self.mpi_all_registered_event = asyncio.Event()
 
-    # create new tmux pane
-    async with tmux_lock:
-        # run ssh with reptyr in tmux pane
-        if mpi_host == controller_hostname:
-            pane_cmd = f"bash -c "
-        else:
-            pane_cmd = f"ssh -t {mpi_host} "
-        pane_cmd += f" 'cd {os.getcwd()}; {REPTYR_CMD} -l {sys.argv[0]} getreptyrpty {tmpfile}'"
-        cmd = f"tmux split-window -d -P -F '#{{pane_id}} #{{pane_pid}}' {pane_cmd}"
-        result = await run_cmd(cmd, capture_stdout=True)
+        # triggered once the grid is created
+        self.grid_created_event = asyncio.Event()
+        self.panes = []
+
+
+    async def create_new_pane(self, client_info):
+        """
+        create a new tmux pane for the client
+        """
+        async with self.tmux_lock:
+            mpi_rank = client_info["mpi_rank"]
+            mpi_host = client_info["client_hostname"]
+            tmpfile = client_info["tmpfile"]
+
+            # run ssh with reptyr in tmux pane
+            if mpi_host == self.hostname:
+                pane_cmd = f"bash -c "
+            else:
+                pane_cmd = f"ssh -t {mpi_host} "
+            pane_cmd += f" 'cd {os.getcwd()}; {REPTYR_CMD} -l {self.tmpi} getreptyrpty {tmpfile}'"
+            cmd = f"tmux split-window -t {self.window} -d -P -F '#{{pane_id}} #{{pane_pid}}' {pane_cmd}"
+            result = await run_cmd(cmd, capture_stdout=True)
+
+            pane,pane_pid = result.decode('utf-8').split()
+            self.client_infos[mpi_rank]["pane"] = pane
+            self.client_infos[mpi_rank]["pane_pid"] = pane_pid
+
+            # add title to pane
+            cmd = f'tmux select-pane -t {pane} -T "rank {mpi_rank} ({mpi_host})"'
+            await run_cmd(cmd)
+
+            # re-set layout
+            cmd = f"tmux select-layout -t {pane} tiled"
+            await run_cmd(cmd)
+
+            # select pane
+            cmd = f'tmux select-pane -t {pane}'
+            await run_cmd(cmd)
+
+            return pane, pane_pid
+
+
+    async def create_grid(self):
+        # wait for registration of all mpi events
+        await self.mpi_all_registered_event.wait()
+
+        # create new tmux panes
+        for i in range(self.nprocs):
+            # determine mpi_rank that should go into that pane
+            mpi_rank = i
+
+            client_info = self.client_infos[mpi_rank]
+
+            # create tmux pane
+            pane,_ = await self.create_new_pane(client_info)
+            self.panes.append(pane)
 
         # kill dummy pane
-        kill_dummy_event.set()
+        async with self.tmux_lock:
+            await run_cmd(f"tmux kill-pane -t '{self.dummy_pane}'")
+            # focus on last pane
+            await run_cmd(f"tmux select-layout -t {self.panes[-1]} tiled")
 
-        pane,pane_pid = result.decode('utf-8').split()
-
-        # add title to pane
-        cmd = f'tmux select-pane -t {pane} -T "rank {mpi_rank} ({mpi_host})"'
-        await run_cmd(cmd)
-
-        # highlight world rank 0
-        if mpi_rank == 0:
-            cmd = f'tmux select-pane -t {pane} -T "#[fg=blue]rank {mpi_rank} ({mpi_host})"'
-            await run_cmd(cmd)
-            if TMPI_REMAIN in ["RANK0", "rank0"]:
-                # keep rank 0
-                cmd = f'tmux set-option -p -t {pane} remain-on-exit on'
-                await run_cmd(cmd)
-
-        #cmd = f"tmux select-layout -t {pane} even-horizontal" -> no grid, only columns
-        cmd = f"tmux select-layout -t {pane} tiled"
-        await run_cmd(cmd)
-
-    answer = {}
-    message = json.dumps(answer).encode('utf-8')
-    writer.write(message)
-    await writer.drain()
-
-    # wait for last confirmation of read
-    # > here we also now that the tmux ssh command was executed
-    data = await reader.read(255)
-    message = data.decode()
-
-    # Close the connection
-    writer.close()
-    await writer.wait_closed()
+        # make everyone else aware that we are finished
+        self.grid_created_event.set()
 
 
-async def kill_dummy_pane(event, dummy_pane, tmux_lock):
-    await event.wait()
-    #async with tmux_lock:
-    print("Killing dummy pane")
-    await run_cmd(f"tmux kill-pane -t '{dummy_pane}'")
+
+    async def handle_request(self, reader, writer):
+        """
+        Controller side, async, handling of a mpi process registration
+        """
+        # receive information about the mpi process
+        data = await reader.read(255)
+        msg = json.loads(data.decode())
+        op = msg["op"]
+        client_info = msg["client_info"]
+        client_info["addr"] = writer.get_extra_info('peername')
+
+        if op == "register":
+            self.client_infos[client_info["mpi_rank"]] = client_info
+
+            print(f"Registered {client_info}")
+
+            # is_dynamic is True, if the registering mpi process
+            # is not part of the initial nprocs mpi processes
+            # this is usually not relevant
+            is_dynamic = self.mpi_all_registered_event.is_set()
+
+            if not is_dynamic:
+                if len(self.client_infos) >= self.nprocs:
+                    print("All mpi procs registered")
+                    self.mpi_all_registered_event.set()
+                await self.grid_created_event.wait()
+            else:
+                # try to wait make them appear in order
+                print(client_info["mpi_rank"] % self.nprocs)
+                await asyncio.sleep(0.1 * (client_info["mpi_rank"] % self.nprocs))
+
+                # create a new pane manually
+                pane,_ = await self.create_new_pane(client_info)
+                self.panes.append(pane)
+
+            # send empty answer to finish exchange
+            answer = {}
+            message = json.dumps(answer).encode('utf-8')
+            writer.write(message)
+            await writer.drain()
+
+        elif op == "deregister":
+            rank = client_info["mpi_rank"]
+            print(f"Deegister {rank}")
+            pane = self.client_infos[rank]["pane"]
+
+            # send empty answer to finish exchange
+            answer = {}
+            message = json.dumps(answer).encode('utf-8')
+            writer.write(message)
+            await writer.drain()
+
+            async with self.tmux_lock:
+                # we also lock this to avoid race conditions
+                del self.client_infos[rank]
+                del self.panes[self.panes.index(pane)]
+
+                # redraw grid
+                await run_cmd(f"tmux select-layout tiled")
+
+        # Close the connection
+        writer.close()
+        await writer.wait_closed()
 
 
-async def run_server(tmux_window, dummy_pane, mpirun_proc, tmux_lock):
-    """
-    controller side server that waits for the mpi processes to register themselves
-    """
-    # event to communicate the creation of the first additional tmux pane
-    kill_dummy_event = asyncio.Event()
 
-    # setup waiting task to kill the dummy pane
-    kill_dummy_task = asyncio.create_task(kill_dummy_pane(kill_dummy_event, dummy_pane, tmux_lock))
 
-    # create actual server
-    server = await asyncio.start_server(
-        lambda r,w: handle_request(r,w, tmux_window, kill_dummy_event, tmux_lock),
-        LISTEN_ADDRESS, LISTEN_PORT)
 
-    # start serving
-    addrs = ', '.join(str(sock.getsockname()) for sock in server.sockets)
-    print(f'Serving on {addrs}')
-    await server.start_serving()
+    async def run_server(self):
+        """
+        controller side server that waits for the mpi processes to register themselves
+        """
+        # create actual server
+        server = await asyncio.start_server(self.handle_request, LISTEN_ADDRESS, LISTEN_PORT)
 
-    # wait for mpirun process to finish (ie mpi application is done)
-    await mpirun_proc.communicate()
-    server.close()
-    await kill_dummy_task
-    print("Finito")
+        # start serving
+        addrs = ', '.join(str(sock.getsockname()) for sock in server.sockets)
+        print(f'Serving on {addrs}')
+        await server.start_serving()
+
+        create_grid_task = asyncio.create_task(self.create_grid())
+
+        # wait for mpirun process to finish (ie mpi application is done)
+        await self.mpirun_proc.communicate()
+
+        await asyncio.sleep(1)
+
+        create_grid_task.cancel()
+
+        server.close()
+        print("Finito")
 
 
 async def controller(nprocs, cmd):
     """
     this function is called with the initial tmpi call
-    it will start mpi and then manage the tmux window
+    it will start mpi and then start a tcp server that manages the tmux window
     """
     # create a lock for tmux commands
     tmux_lock = asyncio.Lock()
@@ -202,29 +283,67 @@ async def controller(nprocs, cmd):
     # start mpi
     proc = await run_cmd(cmd, background=True)
 
-    # start controller_server
-    await run_server(window, dummy, proc, tmux_lock)
+    # start controller server
+    await Server(sys.argv[0], nprocs, window, dummy, proc, tmux_lock, window).run_server()
 
 
 
 
-async def do_request(host, port, client_hostname, mpi_rank, mpi_node_rank):
+async def register_at_controller(host, port, client_info):
     """
     register current mpi process at controller
     receive reptyr pty path
     """
+
     reader, writer = await asyncio.open_connection(
             host, port)
 
+    # add temporary file to client info
     t = tempfile.NamedTemporaryFile()
+    client_info["tmpfile"]= t.name
 
     # send message
     message = json.dumps({
-        "client_hostname": client_hostname,
-        "client_tmpi_pid": os.getpid(),
-        "tmpfile": t.name,
-        "mpi_rank": mpi_rank,
-        "mpi_node_rank": mpi_node_rank,
+        "op": "register",
+        "client_info": client_info,
+    })
+    writer.write(message.encode('utf-8'))
+    await writer.drain()
+
+    # here we need to wait until all processes are registred
+    # and the grid is created
+
+    # receive (empty) answer
+    data = await reader.read(255)
+    message = data.decode('utf-8')
+    answer = json.loads(message)
+
+    # busy wait until tmpi.py getreptypty if finished
+    while os.path.getsize(t.name) == 0:
+        await asyncio.sleep(0.005)
+    await asyncio.sleep(0.005)
+    with open(t.name) as f:
+        reptyr_pty = f.read().strip()
+
+    # close the connection
+    writer.close()
+    await writer.wait_closed()
+
+    return reptyr_pty
+
+
+async def deregister_at_controller(host, port, client_info):
+    """
+    deregister current mpi process at controller
+    """
+    client_hostname = socket.gethostname()
+
+    reader, writer = await asyncio.open_connection(host, port)
+
+    # send message
+    message = json.dumps({
+        "op": "deregister",
+        "client_info": client_info,
     })
     writer.write(message.encode('utf-8'))
     await writer.drain()
@@ -234,22 +353,12 @@ async def do_request(host, port, client_hostname, mpi_rank, mpi_node_rank):
     message = data.decode('utf-8')
     answer = json.loads(message)
 
-    while os.path.getsize(t.name) == 0:
-        time.sleep(0.005)
-    time.sleep(0.005)
-    with open(t.name) as f:
-        reptyr_pty = f.read().strip()
-
-    # let other side know that we finished reading
-    message = json.dumps({})
-    writer.write(message.encode('utf-8'))
-    await writer.drain()
-
     # close the connection
     writer.close()
     await writer.wait_closed()
 
-    return reptyr_pty
+    return answer
+
 
 
 async def mpiproc(args):
@@ -259,19 +368,46 @@ async def mpiproc(args):
     controller_hostname = args[0]
     args = args[1:]
 
-    hostname = socket.gethostname()
+    client_hostname = socket.gethostname()
     mpi_rank = int(os.environ.get("OMPI_COMM_WORLD_RANK", os.environ.get("PMIX_RANK", "-1")))
     mpi_node_rank = int(os.environ.get("OMPI_COMM_WORLD_NODE_RANK", "-1"))
-
-    # try to make rank 0 appear on top left pane
-    if mpi_rank != 0:
-        time.sleep(0.05)
+    mpi_local_rank = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", "-1"))
+    client_info = {
+        "client_hostname": client_hostname,
+        "client_tmpi_pid": os.getpid(),
+        "mpi_rank": mpi_rank,
+        "mpi_node_rank": mpi_node_rank,
+        "mpi_local_rank": mpi_local_rank,
+    }
 
     # Register ourselves at controller
-    reptyr_pty = await do_request(controller_hostname, LISTEN_PORT, hostname, mpi_rank, mpi_node_rank)
+    reptyr_pty = await register_at_controller(controller_hostname, LISTEN_PORT, client_info)
 
     # run actual command using reptyr pty (which is connected to a tmux pane)
-    await run_cmd(f"setsid {sys.argv[0]} reptyrattach {reptyr_pty} {' '.join(shlex.quote(arg) for arg in args)}")
+    await run_cmd(f"setsid {sys.argv[0]} reptyrattach {reptyr_pty} {' '.join(shlex.quote(arg) for arg in args)}", ignore_ret=True)
+
+    # deregister ourselves at controller
+    await deregister_at_controller(controller_hostname, LISTEN_PORT, client_info)
+
+
+def reptyrattach(reptyr_pty):
+    # make reptyr pty the main pty
+    fd = os.open(reptyr_pty, os.O_RDWR)
+    if fd == -1:
+        os.perror("failed to attach to reptyr: open")
+        sys.exit(1)
+
+    if fcntl.ioctl(fd, termios.TIOCSCTTY, 0) != 0:
+        os.perror("failed to attach to reptyr: ioctl")
+        sys.exit(1)
+
+    os.dup2(fd, 0)
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+
+    # exec the actual mpi program
+    #print(" ".join(shlex.quote(s) for s in sys.argv[3:]))
+    os.execvp(sys.argv[3], sys.argv[3:])
 
 
 def check_tools():
@@ -325,24 +461,7 @@ def main():
         with open(sys.argv[2], "w+") as f:
             f.write(reptyr_pty + "\n")
     elif sys.argv[1] == "reptyrattach":
-        # make reptyr pty the main pty
-        reptyr_pty = sys.argv[2]
-        fd = os.open(reptyr_pty, os.O_RDWR)
-        if fd == -1:
-            os.perror("failed to attach to reptyr: open")
-            sys.exit(1)
-
-        if fcntl.ioctl(fd, termios.TIOCSCTTY, 0) != 0:
-            os.perror("failed to attach to reptyr: ioctl")
-            sys.exit(1)
-
-        os.dup2(fd, 0)
-        os.dup2(fd, 1)
-        os.dup2(fd, 2)
-
-        # exec the actual mpi program
-        #print(" ".join(shlex.quote(s) for s in sys.argv[3:]))
-        os.execvp(sys.argv[3], sys.argv[3:])
+        reptyrattach(sys.argv[2])
     else:
         # actual user invocation
         check_tools()
