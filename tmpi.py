@@ -266,7 +266,7 @@ async def controller(nprocs, cmd):
         # synchronize input to all panes.
         await run_cmd(f"tmux set-option -w -t {window} synchronize-panes on")
         # optionally let pane stay open after program exited
-        if TMPI_REMAIN in ["1", "True", "true", "TRUE", "on", "yes"]:
+        if TMPI_REMAIN.lower() in ["1", "true", "on", "yes"]:
             await run_cmd(f"tmux set-option -w -t {window} remain-on-exit on")
         else:
             await run_cmd(f"tmux set-option -w -t {window} remain-on-exit off")
@@ -429,7 +429,7 @@ Usage:
 You need to pass at least two arguments.
 The first argument is the number of processes to use, every argument after that is the commandline to run.
 
-If TMPI_REMAIN=true, ghe new window is set to remain on exit and has to be closed manually. ("C-b + &" by default)
+If TMPI_REMAIN=true, the new window is set to remain on exit and has to be closed manually. ("C-b + &" by default)
 You can pass additional 'mpirun' argument via the MPIRUNARGS environment variable
 You can use the environment variable TMPI_TMUX_OPTIONS to pass options to the `tmux` invocation,
   such as '-f ~/.tmux.conf.tmpi' to use a special tmux configuration for tmpi.
@@ -450,6 +450,7 @@ def main():
     """
     if len(sys.argv) < 2:
         usage()
+        return
 
     if sys.argv[1] == "mpirun":
         # started via mpirun, "client"
