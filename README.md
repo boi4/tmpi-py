@@ -5,6 +5,7 @@ This is a python rewrite of [tmpi](https://github.com/Azrael3000/tmpi) with the 
 * Faster startup
 * Support mpirun with multiple hosts (with `MPIRUNARGS="--host ..." ./tmpi.py ...`)
 * mpi rank and host are shown in the upper frame of each pane
+* no escaping of quotation marks and similar things needed
 
 It has the following disadvantages:
 

@@ -23,7 +23,6 @@ import shlex
 import sys
 import termios
 import tempfile
-import time
 
 # the address and port that the program will listen to new mpi processes
 LISTEN_ADDRESS = "0.0.0.0"
@@ -49,7 +48,7 @@ async def run_cmd(cli, capture_stdout=False, exec=False, ignore_ret=False, backg
         os.execlp(args[0], *args)
 
     #proc = subprocess.Popen(args, stdout=subprocess.PIPE if capture_stdout else None)
-    proc = await asyncio.create_subprocess_exec(*args, stdout=subprocess.PIPE if capture_stdout else None)
+    proc = await asyncio.create_subprocess_exec(*args, stdout=subprocess.PIPE if capture_stdout else None, env=os.environ)
     if not background:
         stdout, _ = await proc.communicate()
         if proc.returncode != 0 and not ignore_ret:
@@ -195,7 +194,7 @@ class Server:
 
         elif op == "deregister":
             rank = client_info["mpi_rank"]
-            print(f"Deegister {rank}")
+            print(f"Deregister {rank}")
             pane = self.client_infos[rank]["pane"]
 
             # send empty answer to finish exchange
